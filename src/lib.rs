@@ -1,10 +1,9 @@
 //! FPN-YOLO object detection library
 
 use candle_core::{Device, DType, Result, Tensor};
-use candle_nn::{self as nn, Conv2d, Conv2dConfig, Module, VarBuilder, VarMap, BatchNorm, Linear};
-use opencv::core::{Mat, MatTrait, MatTraitConst, Point, Rect, Scalar, Size, Vec3b, Vector, CV_32F};
-use opencv::imgcodecs::{imread, imwrite, IMREAD_COLOR};
-use opencv::imgproc::{cvt_color, resize, COLOR_BGR2RGB, INTER_LINEAR, rectangle, put_text, FONT_HERSHEY_SIMPLEX, LINE_8};
+use candle_nn::{self as nn, Conv2d, Conv2dConfig, Module, VarBuilder, Linear};
+use opencv::core::{Mat, MatTraitConst, Point, Rect, Scalar, Size, Vec3b, Vector};
+use opencv::imgproc::{rectangle, put_text, FONT_HERSHEY_SIMPLEX, LINE_8};
 use opencv::dnn::{NetTrait, NetTraitConst};
 
 use std::sync::Arc;
@@ -12,12 +11,8 @@ use rayon::prelude::*;
 use parking_lot::{Mutex, RwLock};
 use num_cpus;
 
-use tokio::sync::Semaphore;
-use futures::future::join_all;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
-use smallvec::SmallVec;
-use crossbeam_channel::{bounded, Receiver, Sender};
 use std::collections::VecDeque;
 
 #[cfg(feature = "python-bindings")]
@@ -538,7 +533,7 @@ impl RPN {
         self.apply_nms(all_proposals)
     }
 
-    fn decode_proposals(&self, cls_logits: &Tensor, bbox_pred: &Tensor, anchors: &[Anchor]) -> Result<Vec<ProposalBox>> {
+    fn decode_proposals(&self, _cls_logits: &Tensor, _bbox_pred: &Tensor, anchors: &[Anchor]) -> Result<Vec<ProposalBox>> {
         let mut proposals = Vec::new();
         
         for (i, anchor) in anchors.iter().enumerate() {
@@ -609,7 +604,7 @@ impl FastRCNN {
         Ok(Self { head, roi_pool_size, num_classes })
     }
 
-    pub fn forward(&self, pyramid_features: &PyramidFeatures, proposals: &[ProposalBox], image_size: (usize, usize)) -> Result<Vec<Detection>> {
+    pub fn forward(&self, pyramid_features: &PyramidFeatures, proposals: &[ProposalBox], _image_size: (usize, usize)) -> Result<Vec<Detection>> {
         let mut detections = Vec::new();
         
         for proposal in proposals {
@@ -633,7 +628,7 @@ impl FastRCNN {
         (k as usize).clamp(0, 4)
     }
 
-    fn roi_pool(&self, feature_map: &Tensor, proposal: &ProposalBox) -> Result<Tensor> {
+    fn roi_pool(&self, feature_map: &Tensor, _proposal: &ProposalBox) -> Result<Tensor> {
         let dims = feature_map.dims();
         let pooled_size = self.roi_pool_size;
         
@@ -641,7 +636,7 @@ impl FastRCNN {
         Ok(pooled_features.flatten_from(1)?)
     }
 
-    fn decode_detection(&self, cls_scores: Tensor, bbox_pred: Tensor, proposal: &ProposalBox) -> Result<Detection> {
+    fn decode_detection(&self, _cls_scores: Tensor, _bbox_pred: Tensor, proposal: &ProposalBox) -> Result<Detection> {
         Ok(Detection {
             x: proposal.x,
             y: proposal.y,
@@ -675,7 +670,7 @@ impl AnchorGenerator {
         Self { sizes, aspect_ratios }
     }
 
-    pub fn generate_level_anchors(&self, level: usize, height: usize, width: usize, image_size: (usize, usize)) -> Vec<Anchor> {
+    pub fn generate_level_anchors(&self, level: usize, height: usize, width: usize, _image_size: (usize, usize)) -> Vec<Anchor> {
         let mut anchors = Vec::new();
         let size = self.sizes[level];
         let stride = 4.0 * 2_f32.powi(level as i32);
@@ -781,7 +776,7 @@ pub fn mat_to_tensor_optimized(mat: &Mat, device: &Device) -> Result<Tensor> {
 
 pub fn convert_mat_data_optimized(mat: &Mat, total_elements: usize) -> Vec<f32> {
     let mut data = Vec::with_capacity(total_elements);
-    let rows = mat.rows() as usize;
+    let _rows = mat.rows() as usize;
     let cols = mat.cols() as usize;
     
     for idx in 0..total_elements {
@@ -951,7 +946,7 @@ fn process_with_fpn_enhancement(
 
 fn create_fpn_enhanced_input(
     original_img: &Mat,
-    fpn_features: &PyramidFeatures,
+    _fpn_features: &PyramidFeatures,
     target_size: i32,
 ) -> anyhow::Result<Mat> {
     let mut enhanced_img = Mat::default();
