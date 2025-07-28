@@ -183,20 +183,11 @@ verify_package() {
     log_info "Checking wheel contents..."
     python -m zipfile -l "$WHEEL_FILE" | head -20
     
-    # Test installation in a temporary virtual environment
+    # Test installation using uv (faster and more reliable)
     log_info "Testing package installation..."
-    TEMP_VENV=$(mktemp -d)
-    python -m venv "$TEMP_VENV"
-    source "$TEMP_VENV/bin/activate"
     
-    # Install dependencies first
-    pip install numpy opencv-python
-    
-    # Install our package
-    pip install "$WHEEL_FILE"
-    
-    # Test import
-    python -c "
+    # Test import using uv which handles dependencies automatically
+    uv run python -c "
 import fpn_yolo_rs
 print('✅ Package import successful')
 detector = fpn_yolo_rs.PyFPNYOLO()
@@ -209,13 +200,8 @@ print(detector.get_system_info())
         log_success "Package verification completed successfully"
     else
         log_error "Package verification failed"
-        deactivate
-        rm -rf "$TEMP_VENV"
         exit 1
     fi
-    
-    deactivate
-    rm -rf "$TEMP_VENV"
 }
 
 create_distribution_package() {
