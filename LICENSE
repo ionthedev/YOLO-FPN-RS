@@ -1,0 +1,20 @@
+Copyright (c) 2025, Brandon Friend
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of
+the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+In plain language:
+- You may use, modify, and distribute this source code under the AGPL-3.0 license.
+- If you make changes or build derivative works from this code (including providing it as a service over a network), you must release your modifications under the same license.
+- This license is chosen for compatibility with YOLOv8's AGPL-3.0 requirements, as the project implements or is inspired by YOLOv8 algorithms and architectures.
+- For closed-source commercial use without these restrictions, contact Ultralytics for a paid enterprise license.

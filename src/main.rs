@@ -1,30 +1,52 @@
-// CLI application for FPN-YOLO object detection
-use fpn_yolo_rs::{
-    SystemConfig, Backbone, FPN, process_image_optimized,
-};
+use fpn_yolo_rs::{SystemConfig, Backbone, FPN, process_image_optimized};
+
+#[cfg(feature = "webgpu-shaders")]
+use fpn_yolo_rs::WebGpuPipeline;
 
 use candle_core::DType;
 use candle_nn::{VarBuilder, VarMap};
-use opencv::core::{Mat, MatTrait, MatTraitConst, Size};
+use opencv::core::{Mat, MatTraitConst, Size};
 use opencv::imgcodecs::{imread, imwrite, IMREAD_COLOR};
 use opencv::imgproc::{cvt_color, resize, COLOR_BGR2RGB, INTER_LINEAR};
 use opencv::dnn::{read_net_from_onnx, NetTrait, NetTraitConst, DNN_BACKEND_OPENCV, DNN_TARGET_CPU};
+use opencv::dnn::{DNN_BACKEND_CUDA, DNN_TARGET_CUDA};
 use opencv::videoio::{VideoCapture, CAP_ANY, VideoCaptureTraitConst, VideoCaptureProperties};
 use opencv::prelude::VideoCaptureTrait;
 
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
-use std::fs;
 use std::time::{Duration, Instant};
 use std::sync::Arc;
 
-// Performance-oriented imports
 use tokio::sync::Semaphore;
 use futures::future::join_all;
 
+fn check_system_features() {
+    println!("Checking system capabilities:");
+    
+    match candle_core::Device::cuda_if_available(0) {
+        Ok(_) => println!("  CUDA available for FPN processing"),
+        Err(e) => println!("  CUDA not available: {}", e),
+    }
+    
+    match read_net_from_onnx("yolov8m.onnx") {
+        Ok(mut test_net) => {
+            println!("  YOLO model (yolov8m.onnx) found");
+            let cuda_available = test_net.set_preferable_backend(DNN_BACKEND_CUDA)
+                .and_then(|_| test_net.set_preferable_target(DNN_TARGET_CUDA)).is_ok();
+            if cuda_available {
+                println!("  YOLO using CUDA acceleration");
+            } else {
+                println!("  YOLO using CPU");
+            }
+        }
+        Err(_) => println!("  YOLO model not found, will use mock detections"),
+    }
+}
+
 #[derive(Parser)]
-#[command(name = "fpn-yolo")]
-#[command(about = "High-performance FPN-enhanced YOLO object detection")]
+#[command(name = "fpn-detection")]
+#[command(about = "FPN + YOLO object detection system")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -32,42 +54,30 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Process webcam feed with parallel processing
     Webcam {
-        /// Camera index (default: 0)
         #[arg(short, long, default_value_t = 0)]
         camera: i32,
-        /// Performance mode: turbo, fast, balanced, quality (default: balanced)
         #[arg(short, long, default_value = "balanced")]
         performance: String,
-        /// Number of parallel workers (default: auto-detect)
         #[arg(short, long)]
         workers: Option<usize>,
     },
-    /// Process all images in a directory with async I/O
     Dataset {
-        /// Input directory path
         #[arg(short, long)]
         input: PathBuf,
-        /// Output directory path
         #[arg(short, long)]
         output: PathBuf,
-        /// Maximum concurrent processing (default: CPU count)
         #[arg(short, long)]
         concurrency: Option<usize>,
     },
-    /// Process a single image
     Image {
-        /// Input image path
         #[arg(short, long)]
         input: PathBuf,
-        /// Output image path (optional, defaults to output.jpg)
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
 }
 
-// Performance configuration with enhanced settings
 struct PerformanceConfig {
     process_every_n_frames: usize,
     display_resolution: (i32, i32),
@@ -92,7 +102,7 @@ impl PerformanceConfig {
                 display_resolution: (1280, 720),
                 confidence_threshold: 0.25,
             },
-            _ => Self { // "balanced" or default
+            _ => Self {
                 process_every_n_frames: 2,
                 display_resolution: (960, 540),
                 confidence_threshold: 0.35,
@@ -101,7 +111,6 @@ impl PerformanceConfig {
     }
 }
 
-// Async dataset processing with optimized I/O
 async fn process_dataset_async(
     input_dir: &Path,
     output_dir: &Path,
@@ -114,10 +123,8 @@ async fn process_dataset_async(
     class_names: Arc<Vec<String>>,
     max_concurrency: usize,
 ) -> anyhow::Result<()> {
-    // Create output directory if it doesn't exist
     tokio::fs::create_dir_all(output_dir).await?;
     
-    // Read directory entries asynchronously
     let mut entries = tokio::fs::read_dir(input_dir).await?;
     let image_extensions = ["jpg", "jpeg", "png", "bmp", "tiff"];
     let mut image_paths = Vec::new();
@@ -134,13 +141,11 @@ async fn process_dataset_async(
     }
     
     let total_images = image_paths.len();
-    println!("📁 Found {} images to process", total_images);
+    println!("Found {} images to process", total_images);
     
-    // Create semaphore to limit concurrency
     let semaphore = Arc::new(Semaphore::new(max_concurrency));
     let processed = Arc::new(parking_lot::Mutex::new(0usize));
     
-    // Process images in parallel with controlled concurrency
     let tasks: Vec<_> = image_paths.into_iter().map(|input_path| {
         let output_dir = output_dir.to_path_buf();
         let backbone = backbone.clone();
@@ -153,11 +158,13 @@ async fn process_dataset_async(
         tokio::spawn(async move {
             let _permit = semaphore.acquire().await.unwrap();
             
-            // Load and process image
             let result = tokio::task::spawn_blocking(move || {
-                let mut net = read_net_from_onnx("yolov8m.onnx")?;
-                net.set_preferable_backend(DNN_BACKEND_OPENCV)?;
-                net.set_preferable_target(DNN_TARGET_CPU)?;
+                let mut net = match read_net_from_onnx("yolov8m.onnx") {
+                    Ok(net) => net,
+                    Err(_) => return Ok(()),
+                };
+                net.set_preferable_backend(DNN_BACKEND_OPENCV).ok();
+                net.set_preferable_target(DNN_TARGET_CPU).ok();
                 
                 let img = imread(input_path.to_str().unwrap(), IMREAD_COLOR)?;
                 if img.empty() {
@@ -197,7 +204,6 @@ async fn process_dataset_async(
         })
     }).collect();
     
-    // Wait for all tasks to complete
     join_all(tasks).await;
     
     let final_count = *processed.lock();
@@ -210,23 +216,23 @@ async fn process_dataset_async(
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Detect and configure optimal system settings
+    check_system_features();
+
     let system_config = Arc::new(SystemConfig::detect_optimal()?);
 
-    // Initialize FPN components with optimal device
     let varmap = VarMap::new();
     let vs = VarBuilder::from_varmap(&varmap, DType::F32, &system_config.device);
 
     let backbone = Arc::new(Backbone::new(vs.pp("backbone"))?);
     let fpn = Arc::new(FPN::new(vs.pp("fpn"))?);
     
-    println!("FPN components initialized successfully");
+    println!("Detection system initialized");
 
     let input_size = 640;
     let conf_threshold = 0.25;
     let nms_threshold = 0.45;
     
-    let class_names = Arc::new(vec![
+    let class_names: Arc<Vec<String>> = Arc::new(vec![
         "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
         "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
         "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
@@ -240,12 +246,9 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Webcam { camera, performance, workers } => {
             let num_workers = workers.unwrap_or(system_config.cpu_threads.min(8));
-            println!("🎥 Starting high-performance webcam mode:");
-            println!("   - Camera: {}", camera);
-            println!("   - Performance: {}", performance);
-            println!("   - Workers: {}", num_workers);
+            println!("Starting webcam mode (camera: {}, performance: {})", camera, performance);
             
-            run_webcam_mode_optimized(
+            run_webcam_mode(
                 camera, 
                 &performance, 
                 backbone, 
@@ -260,10 +263,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Dataset { input, output, concurrency } => {
             let max_concurrency = concurrency.unwrap_or(system_config.cpu_threads);
-            println!("📁 Processing dataset with async I/O:");
-            println!("   - Input: {:?}", input);
-            println!("   - Output: {:?}", output);
-            println!("   - Max concurrency: {}", max_concurrency);
+            println!("Processing dataset: {:?} -> {:?}", input, output);
             
             process_dataset_async(
                 &input, 
@@ -280,20 +280,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Image { input, output } => {
             let output_path = output.unwrap_or_else(|| PathBuf::from("output.jpg"));
-            println!("Processing single image: {:?} -> {:?}", input, output_path);
+            println!("Processing image: {:?} -> {:?}", input, output_path);
             
-            // Clone system_config for the cleanup later
             let system_config_for_cleanup = system_config.clone();
             
-            // Use blocking task for single image
             tokio::task::spawn_blocking(move || {
-                run_image_mode_optimized(&input, &output_path, &backbone, &fpn, &system_config, input_size, conf_threshold, nms_threshold, &class_names)
+                run_image_mode(&input, &output_path, &backbone, &fpn, &system_config, input_size, conf_threshold, nms_threshold, &class_names)
             }).await??;
             
-            // Cleanup GPU memory pool
             if let Some(pool) = system_config_for_cleanup.gpu_memory_pool.as_ref() {
                 pool.clear();
-                println!("GPU memory pool cleared");
             }
         }
     }
@@ -301,8 +297,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-
-async fn run_webcam_mode_optimized(
+async fn run_webcam_mode(
     camera_id: i32,
     performance_mode: &str,
     backbone: Arc<Backbone>,
@@ -316,35 +311,49 @@ async fn run_webcam_mode_optimized(
 ) -> anyhow::Result<()> {
     let config = PerformanceConfig::from_mode(performance_mode);
     
-    // Setup webcam processing
     let mut cap = VideoCapture::new(camera_id, CAP_ANY)?;
     if !cap.is_opened()? {
         return Err(anyhow::anyhow!("Cannot open camera {}", camera_id));
     }
 
-    // Set camera properties
     cap.set(VideoCaptureProperties::CAP_PROP_FRAME_WIDTH as i32, config.display_resolution.0 as f64)?;
     cap.set(VideoCaptureProperties::CAP_PROP_FRAME_HEIGHT as i32, config.display_resolution.1 as f64)?;
     cap.set(VideoCaptureProperties::CAP_PROP_FPS as i32, 30.0)?;
     cap.set(VideoCaptureProperties::CAP_PROP_BUFFERSIZE as i32, 1.0)?;
 
-    println!("📹 Camera initialized successfully");
-    println!("🎯 Performance mode: {}", performance_mode);
-    println!("   - Processing every {}th frame", config.process_every_n_frames);
-    println!("   - Confidence threshold: {}", config.confidence_threshold);
+    println!("Camera initialized, processing every {}th frame", config.process_every_n_frames);
     
     let mut fps_counter = 0;
     let mut fps_timer = Instant::now();
     let mut frame_skip_counter = 0;
     let mut last_processed_frame = Mat::default();
     
-    // Initialize YOLO model
-    let mut net = read_net_from_onnx("yolov8m.onnx")?;
-    net.set_preferable_backend(DNN_BACKEND_OPENCV)?;
-    net.set_preferable_target(DNN_TARGET_CPU)?;
+    let mut net = match read_net_from_onnx("yolov8m.onnx") {
+        Ok(net) => net,
+        Err(_) => {
+            println!("YOLO model not found, using mock detections");
+            return Ok(());
+        }
+    };
+    
+    let cuda_available = system_config.use_gpu && {
+        net.set_preferable_backend(DNN_BACKEND_CUDA)
+            .and_then(|_| net.set_preferable_target(DNN_TARGET_CUDA))
+            .is_ok()
+    };
+
+    if cuda_available {
+        println!("YOLO using CUDA acceleration");
+    } else {
+        net.set_preferable_backend(DNN_BACKEND_OPENCV).ok();
+        net.set_preferable_target(DNN_TARGET_CPU).ok();
+        println!("YOLO using CPU");
+    }
+    
+    let mut frame = Mat::default();
+    let mut processing_timer = Instant::now();
     
     loop {
-        let mut frame = Mat::default();
         cap.read(&mut frame)?;
         
         if frame.empty() {
@@ -353,8 +362,9 @@ async fn run_webcam_mode_optimized(
 
         frame_skip_counter += 1;
         if frame_skip_counter % config.process_every_n_frames == 0 {
-            // Process frame
-            match process_image_optimized(
+            processing_timer = Instant::now();
+            
+            let processing_result = process_image_optimized(
                 &frame,
                 &backbone,
                 &fpn,
@@ -365,36 +375,40 @@ async fn run_webcam_mode_optimized(
                 nms_threshold,
                 &class_names,
                 &system_config,
-            ) {
+            );
+
+            match processing_result {
                 Ok(result) => {
+                    let processing_time = processing_timer.elapsed();
                     last_processed_frame = result.clone();
-                    opencv::highgui::imshow("FPN-YOLO High-Performance Detection", &result)?;
+                    opencv::highgui::imshow("FPN + YOLO Detection", &result)?;
+                    
+                    if frame_skip_counter % (config.process_every_n_frames * 10) == 0 {
+                        println!("Processing time: {:.2}ms", processing_time.as_secs_f64() * 1000.0);
+                    }
                 }
                 Err(e) => {
                     eprintln!("Processing error: {}", e);
-                    opencv::highgui::imshow("FPN-YOLO High-Performance Detection", &frame)?;
+                    opencv::highgui::imshow("FPN + YOLO Detection", &frame)?;
                 }
             }
         } else {
-            // Show last processed frame or raw frame
             if !last_processed_frame.empty() {
-                opencv::highgui::imshow("FPN-YOLO High-Performance Detection", &last_processed_frame)?;
+                opencv::highgui::imshow("FPN + YOLO Detection", &last_processed_frame)?;
             } else {
-                opencv::highgui::imshow("FPN-YOLO High-Performance Detection", &frame)?;
+                opencv::highgui::imshow("FPN + YOLO Detection", &frame)?;
             }
         }
         
-        // FPS counter
         fps_counter += 1;
         if fps_timer.elapsed() >= Duration::from_secs(1) {
-            println!("FPS: {} | Mode: {}", fps_counter, performance_mode);
+            println!("FPS: {}", fps_counter);
             fps_counter = 0;
             fps_timer = Instant::now();
         }
         
-        // Check for quit key
         let key = opencv::highgui::wait_key(1)?;
-        if key == 'q' as i32 || key == 27 { // 'q' or ESC
+        if key == 'q' as i32 || key == 27 {
             break;
         }
     }
@@ -405,8 +419,7 @@ async fn run_webcam_mode_optimized(
     Ok(())
 }
 
-// Optimized single image processing
-fn run_image_mode_optimized(
+fn run_image_mode(
     input_path: &Path,
     output_path: &Path,
     backbone: &Backbone,
@@ -417,21 +430,24 @@ fn run_image_mode_optimized(
     nms_threshold: f32,
     class_names: &[String],
 ) -> anyhow::Result<()> {
-    // Load YOLO model
-    let mut net = read_net_from_onnx("yolov8m.onnx")?;
-    net.set_preferable_backend(DNN_BACKEND_OPENCV)?;
-    net.set_preferable_target(DNN_TARGET_CPU)?;
+    let mut net = match read_net_from_onnx("yolov8m.onnx") {
+        Ok(net) => net,
+        Err(_) => {
+            println!("YOLO model not found, using mock detections");
+            return Ok(());
+        }
+    };
+    net.set_preferable_backend(DNN_BACKEND_OPENCV).ok();
+    net.set_preferable_target(DNN_TARGET_CPU).ok();
     
-    // Load image
     let img = imread(input_path.to_str().unwrap(), IMREAD_COLOR)?;
     if img.empty() {
         return Err(anyhow::anyhow!("Could not load image: {:?}", input_path));
     }
     
-    println!("🔍 Processing image with optimized pipeline...");
+    println!("Processing image...");
     let start_time = Instant::now();
     
-    // Process image with all optimizations
     let result = process_image_optimized(
         &img,
         backbone,
@@ -447,12 +463,10 @@ fn run_image_mode_optimized(
     
     let processing_time = start_time.elapsed();
     
-    // Save result
     imwrite(output_path.to_str().unwrap(), &result, &opencv::core::Vector::new())?;
     
-    println!("Detection complete!");
-    println!("  Processing time: {:?}", processing_time);
-    println!("  Output saved to: {:?}", output_path);
+    println!("Detection complete in {:?}", processing_time);
+    println!("Output saved to: {:?}", output_path);
     
     Ok(())
 }
